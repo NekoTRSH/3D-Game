@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fractal Ascent</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #score {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 24px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div id="score">Score: 0</div>
+    <div id="instructions">Use Arrow Keys/WASD to Move, Space to Jump. Ascend!</div>
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+        "three": "https://unpkg.com/three@0.150.1/build/three.module.js"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+
+        // Game Constants
+        const PLAYER_SIZE = 0.8;
+        const PLAYER_SPEED = 6;
+        const JUMP_VELOCITY = 20;
+        const GRAVITY = -28;    
+        const PLATFORM_HEIGHT = 0.5;
+        const PLATFORM_XZ_MIN_SIZE = 2;
+        const PLATFORM_XZ_MAX_SIZE = 5;
+        const PLATFORM_GENERATION_RADIUS_XZ = 20;
+        const PLATFORM_GENERATION_AHEAD_Y = 25;
+        const PLATFORM_CLEANUP_BELOW_Y = 30;
+        const INITIAL_PLATFORMS = 30;
+        const MAX_PLATFORMS = 150;
+
+        const NOISE_SCALE_XZ = 15;
+        const NOISE_SCALE_Y = 8;
+        const NOISE_PRESENCE_THRESHOLD = 0.6; // Make platforms much more sparse
+
+        // Global Variables
+        let scene, camera, renderer;
+        let player, playerVelocity = new THREE.Vector3();
+        let isGrounded = false;
+        let platforms = [];
+        let currentBaseY = 0;
+        let highestPlayerY = 0;
+
+        const inputState = {
+            left: false,
+            right: false,
+            forward: false,
+            backward: false,
+            jump: false
+        };
+
+        const RND_A = 134775813;
+        const RND_C = 1;
+        const RND_M = 2147483647;
+        let noiseSeed = Math.random() * RND_M;
+
+        function seededRandom(seed) {
+            return (RND_A * seed + RND_C) % RND_M / RND_M;
+        }
+
+        function simpleNoise3D(x, y, z) {
+            let n = Math.floor(x * 0.1) + Math.floor(y * 0.2) + Math.floor(z * 0.1) + noiseSeed;
+            n = (n << 13) ^ n;
+            n = (n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff;
+            return 1.0 - (n / 1073741824.0);
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.Fog(0x000000, 10, 60);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 5, 10);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0x606080);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 7.5);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 1024;
+            directionalLight.shadow.mapSize.height = 1024;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 50;
+            directionalLight.shadow.camera.left = -20;
+            directionalLight.shadow.camera.right = 20;
+            directionalLight.shadow.camera.top = 20;
+            directionalLight.shadow.camera.bottom = -20;
+            scene.add(directionalLight);
+
+            const playerGeometry = new THREE.BoxGeometry(PLAYER_SIZE, PLAYER_SIZE, PLAYER_SIZE);
+            const playerMaterial = new THREE.MeshPhongMaterial({ color: 0x00ffff });
+            player = new THREE.Mesh(playerGeometry, playerMaterial);
+            player.castShadow = true;
+            
+            // *** MODIFICATION 1: Correct player initial position ***
+            // Player's center Y = Platform's top Y + Player's half size
+            // Initial platform is centered at Y=0, so its top is at PLATFORM_HEIGHT / 2.
+            player.position.x = 0;
+            player.position.z = 0;
+            player.position.y = (PLATFORM_HEIGHT / 2) + (PLAYER_SIZE / 2);
+            scene.add(player);
+
+            generateInitialPlatforms();
+
+            window.addEventListener('resize', onWindowResize);
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+
+            animate();
+        }
+
+        function createPlatform(x, y, z, width, depth) {
+            const platformGeometry = new THREE.BoxGeometry(width, PLATFORM_HEIGHT, depth);
+            const hue = (y / 100) % 1;
+            const platformMaterial = new THREE.MeshPhongMaterial({
+                color: new THREE.Color().setHSL(hue, 0.7, 0.5),
+                shininess: 20
+            });
+            const platform = new THREE.Mesh(platformGeometry, platformMaterial);
+            platform.position.set(x, y, z);
+            platform.receiveShadow = true;
+            platform.castShadow = true;
+            platform.userData.bb = new THREE.Box3().setFromObject(platform);
+            platforms.push(platform);
+            scene.add(platform);
+        }
+
+        function generateInitialPlatforms() {
+            // Create a stable starting platform, centered at (0,0,0)
+            createPlatform(0, 0, 0, 5, 5); 
+            currentBaseY = 0; 
+            // Calculate maximum jump height based on physics
+            const MAX_JUMP_HEIGHT = (JUMP_VELOCITY * JUMP_VELOCITY) / (2 * Math.abs(GRAVITY));
+            const SAFE_MAX_HEIGHT_DIFF = MAX_JUMP_HEIGHT * 0.7; // Use consistent 70% of max height for safety
+
+            for (let i = 0; i < INITIAL_PLATFORMS; i++) {
+                const x = (Math.random() - 0.5) * PLATFORM_GENERATION_RADIUS_XZ * 0.5;
+                const z = (Math.random() - 0.5) * PLATFORM_GENERATION_RADIUS_XZ * 0.5;
+                const y = currentBaseY + Math.random() * SAFE_MAX_HEIGHT_DIFF + 2; // Ensure reachable height
+                const width = PLATFORM_XZ_MIN_SIZE + Math.random() * (PLATFORM_XZ_MAX_SIZE - PLATFORM_XZ_MIN_SIZE);
+                const depth = PLATFORM_XZ_MIN_SIZE + Math.random() * (PLATFORM_XZ_MAX_SIZE - PLATFORM_XZ_MIN_SIZE);
+                createPlatform(x, y, z, width, depth);
+                if (y > currentBaseY) currentBaseY = y;
+            }
+        }
+
+        function managePlatforms() {
+            const generationTriggerY = player.position.y - 10; // Generate when player is 10 units below the current generation level
+
+            if (player.position.y > generationTriggerY) {
+                let platformsGenerated = 0;
+
+                // Calculate maximum safe height difference for jumps
+                const MAX_JUMP_HEIGHT = (JUMP_VELOCITY * JUMP_VELOCITY) / (2 * Math.abs(GRAVITY));
+                const SAFE_MAX_HEIGHT_DIFF = MAX_JUMP_HEIGHT * 0.7; // Use consistent 70% of max height for safety
+                
+                // Generate platforms in a more distributed way
+                for (let i = 0; i < 50 && platformsGenerated < 8; i++) {
+                    const x = player.position.x + (Math.random() - 0.5) * PLATFORM_GENERATION_RADIUS_XZ * 2;
+                    const z = player.position.z + (Math.random() - 0.5) * PLATFORM_GENERATION_RADIUS_XZ * 2;
+
+                    // Generate platforms in a wider height range ahead of the player
+                    const heightRange = SAFE_MAX_HEIGHT_DIFF * 2; // Allow platforms up to 2x safe jump height ahead
+                    const yNoiseFactor = (simpleNoise3D(x / NOISE_SCALE_XZ, player.position.y / NOISE_SCALE_Y, z / NOISE_SCALE_XZ) + 1) / 2;
+                    const y = player.position.y + 2 + (yNoiseFactor * heightRange);
+                    
+                    const presenceNoise = (simpleNoise3D(x / NOISE_SCALE_XZ, y / NOISE_SCALE_Y, z / NOISE_SCALE_XZ) + 1) / 2;
+
+                    // Only generate if the platform would be reachable eventually and passes noise test
+                    if (presenceNoise > NOISE_PRESENCE_THRESHOLD && y < player.position.y + heightRange) {
+                        const width = PLATFORM_XZ_MIN_SIZE + Math.random() * (PLATFORM_XZ_MAX_SIZE - PLATFORM_XZ_MIN_SIZE);
+                        const depth = PLATFORM_XZ_MIN_SIZE + Math.random() * (PLATFORM_XZ_MAX_SIZE - PLATFORM_XZ_MIN_SIZE);
+                        createPlatform(x, y, z, width, depth);
+                        platformsGenerated++;
+                    }
+                }
+                 // Update currentBaseY more gradually
+                 if (platformsGenerated > 0) {
+                    currentBaseY = Math.max(currentBaseY, player.position.y + 15);
+                 }
+            }
+
+            const cleanupThresholdY = player.position.y - PLATFORM_CLEANUP_BELOW_Y;
+            for (let i = platforms.length - 1; i >= 0; i--) {
+                if (platforms[i].position.y < cleanupThresholdY) {
+                    scene.remove(platforms[i]);
+                    platforms[i].geometry.dispose();
+                    platforms[i].material.dispose();
+                    platforms.splice(i, 1);
+                }
+            }
+
+            while (platforms.length > MAX_PLATFORMS) {
+                const oldestPlatform = platforms.shift();
+                scene.remove(oldestPlatform);
+                oldestPlatform.geometry.dispose();
+                oldestPlatform.material.dispose();
+            }
+        }
+
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // *** MODIFICATION 2: Clamp deltaTime ***
+            const rawDeltaTime = clock.getDelta();
+            const deltaTime = Math.min(rawDeltaTime, 1/30); // Clamp to a max of 1/30th of a second
+
+            handleInput(deltaTime);
+            updatePlayer(deltaTime);
+            checkCollisions();
+            managePlatforms();
+            updateCamera();
+
+            highestPlayerY = Math.max(highestPlayerY, player.position.y);
+            const MAX_JUMP_HEIGHT = (JUMP_VELOCITY * JUMP_VELOCITY) / (2 * Math.abs(GRAVITY));
+            document.getElementById('score').innerText = `Score: ${Math.floor(highestPlayerY)} | Max Jump: ${MAX_JUMP_HEIGHT.toFixed(1)}`;
+
+            if (player.position.y < -PLATFORM_CLEANUP_BELOW_Y - 20) {
+                resetGame();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function handleInput(deltaTime) {
+            const moveSpeed = PLAYER_SPEED * deltaTime; // Not used directly here, velocity set directly
+            let moveDirection = new THREE.Vector3(0,0,0);
+
+            if (inputState.forward) moveDirection.z -= 1;
+            if (inputState.backward) moveDirection.z += 1;
+            if (inputState.left) moveDirection.x -= 1;
+            if (inputState.right) moveDirection.x += 1;
+
+            if (moveDirection.lengthSq() > 0) {
+                 moveDirection.normalize();
+                const cameraForward = new THREE.Vector3();
+                camera.getWorldDirection(cameraForward);
+                cameraForward.y = 0;
+                cameraForward.normalize();
+                const cameraRight = new THREE.Vector3().crossVectors(camera.up, cameraForward).negate();
+                const worldMoveDirection = new THREE.Vector3();
+                worldMoveDirection.addScaledVector(cameraForward, moveDirection.z);
+                worldMoveDirection.addScaledVector(cameraRight, moveDirection.x);
+                worldMoveDirection.normalize();
+                playerVelocity.x = worldMoveDirection.x * PLAYER_SPEED;
+                playerVelocity.z = worldMoveDirection.z * PLAYER_SPEED;
+            } else {
+                playerVelocity.x *= (1 - 10 * deltaTime);
+                playerVelocity.z *= (1 - 10 * deltaTime);
+            }
+
+            if (inputState.jump && isGrounded) {
+                playerVelocity.y = JUMP_VELOCITY;
+                isGrounded = false;
+            }
+        }
+
+        function updatePlayer(deltaTime) {
+            playerVelocity.y += GRAVITY * deltaTime;
+            player.position.x += playerVelocity.x * deltaTime;
+            player.position.y += playerVelocity.y * deltaTime;
+            player.position.z += playerVelocity.z * deltaTime;
+        }
+
+        function checkCollisions() {
+            isGrounded = false;
+            const playerBox = new THREE.Box3().setFromObject(player);
+
+            platforms.forEach(platform => {
+                const platformBox = platform.userData.bb;
+                if (playerBox.intersectsBox(platformBox)) {
+                    const overlap = new THREE.Box3().copy(playerBox).intersect(platformBox);
+                    const overlapSize = new THREE.Vector3();
+                    overlap.getSize(overlapSize);
+
+                    const prevPlayerBottom = player.position.y - PLAYER_SIZE / 2 - playerVelocity.y * (clock.getDelta() || 1/60); // use last rawDelta or typical
+                    const platformTop = platform.position.y + PLATFORM_HEIGHT / 2;
+
+                    if (overlapSize.y < overlapSize.x && overlapSize.y < overlapSize.z && playerVelocity.y <=0 && prevPlayerBottom >= platformTop - 0.1) {
+                        player.position.y = platformTop + PLAYER_SIZE / 2;
+                        playerVelocity.y = 0;
+                        isGrounded = true;
+                    } else if (overlapSize.y > 0.01) { // Ensure it's not just a brush from falling past
+                        const centerPlayer = new THREE.Vector3();
+                        const centerPlatform = new THREE.Vector3();
+                        playerBox.getCenter(centerPlayer);
+                        platformBox.getCenter(centerPlatform);
+                        const delta = centerPlayer.sub(centerPlatform);
+
+                        if (overlapSize.x < overlapSize.z) {
+                            if (delta.x > 0) player.position.x += overlapSize.x;
+                            else player.position.x -= overlapSize.x;
+                            playerVelocity.x = 0;
+                        } else {
+                            if (delta.z > 0) player.position.z += overlapSize.z;
+                            else player.position.z -= overlapSize.z;
+                            playerVelocity.z = 0;
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateCamera() {
+            const offset = new THREE.Vector3(0, 6, 12);
+            const targetPosition = player.position.clone().add(offset);
+            camera.position.lerp(targetPosition, 0.05);
+            camera.lookAt(player.position.x, player.position.y + 1, player.position.z);
+        }
+
+        function resetGame() {
+            // *** MODIFICATION 3: Correct player position on reset ***
+            player.position.set(0, (PLATFORM_HEIGHT / 2) + (PLAYER_SIZE / 2), 0);
+            playerVelocity.set(0, 0, 0);
+            isGrounded = false;
+            highestPlayerY = 0;
+            currentBaseY = 0;
+            noiseSeed = Math.random() * RND_M;
+
+            platforms.forEach(platform => scene.remove(platform));
+            platforms = [];
+            generateInitialPlatforms();
+            document.getElementById('score').innerText = 'Score: 0';
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onKeyDown(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': inputState.backward = true; break;
+                case 'ArrowDown': case 'KeyS': inputState.forward = true; break;
+                case 'ArrowLeft': case 'KeyA': inputState.left = true; break;
+                case 'ArrowRight': case 'KeyD': inputState.right = true; break;
+                case 'Space': inputState.jump = true; break;
+            }
+        }
+
+        function onKeyUp(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': inputState.backward = false; break;
+                case 'ArrowDown': case 'KeyS': inputState.forward = false; break;
+                case 'ArrowLeft': case 'KeyA': inputState.left = false; break;
+                case 'ArrowRight': case 'KeyD': inputState.right = false; break;
+                case 'Space': inputState.jump = false; break;
+            }
+        }
+        init();
+    </script>
+</body>
+</html>
